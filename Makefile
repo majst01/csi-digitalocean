@@ -1,4 +1,4 @@
-NAME=do-csi-plugin
+NAME=csi-lvm
 OS ?= linux
 ifeq ($(strip $(shell git status --porcelain 2>/dev/null)),)
   GIT_TREE_STATE=clean
@@ -7,8 +7,8 @@ else
 endif
 COMMIT ?= $(shell git rev-parse HEAD)
 BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD)
-LDFLAGS ?= -X github.com/digitalocean/csi-digitalocean/driver.version=${VERSION} -X github.com/digitalocean/csi-digitalocean/driver.commit=${COMMIT} -X github.com/digitalocean/csi-digitalocean/driver.gitTreeState=${GIT_TREE_STATE}
-PKG ?= github.com/digitalocean/csi-digitalocean/cmd/do-csi-plugin
+LDFLAGS ?= -X github.com/metal-pod/csi-lvm/driver.version=${VERSION} -X github.com/metal-pod/csi-lvm/driver.commit=${COMMIT} -X github.com/metal-pod/csi-lvm/driver.gitTreeState=${GIT_TREE_STATE}
+PKG ?= github.com/metal-pod/csi-lvm/cmd/do-csi-plugin
 
 VERSION ?= $(shell cat VERSION)
 DOCKER_REPO ?= digitalocean/do-csi-plugin

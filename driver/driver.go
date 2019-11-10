@@ -24,21 +24,17 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"sync"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	metadata "github.com/digitalocean/go-metadata"
-	"github.com/digitalocean/godo"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/oauth2"
 	"google.golang.org/grpc"
 )
 
 const (
 	// DefaultDriverName defines the name that is used in Kubernetes and the CSI
 	// system for the canonical, official name of this plugin
-	DefaultDriverName = "dobs.csi.digitalocean.com"
+	DefaultDriverName = "lvm.csi.metal-pod.io"
 )
 
 var (
@@ -60,21 +56,16 @@ type Driver struct {
 	publishInfoVolumeName string
 
 	endpoint     string
-	nodeId       string
-	region       string
-	doTag        string
+	nodeID       string
 	isController bool
+
+	vgName         string
+	devicesPattern string
 
 	srv     *grpc.Server
 	log     *logrus.Entry
 	mounter Mounter
-
-	storage        godo.StorageService
-	storageActions godo.StorageActionsService
-	droplets       godo.DropletsService
-	snapshots      godo.SnapshotsService
-	account        godo.AccountService
-	tags           godo.TagsService
+	storage *LVMStorage
 
 	// ready defines whether the driver is ready to function. This value will
 	// be used by the `Identity` service via the `Probe()` method.
@@ -85,40 +76,17 @@ type Driver struct {
 // NewDriver returns a CSI plugin that contains the necessary gRPC
 // interfaces to interact with Kubernetes over unix domain sockets for
 // managaing DigitalOcean Block Storage
-func NewDriver(ep, token, url, doTag, driverName string) (*Driver, error) {
+func NewDriver(ep, nodeID, driverName, vgName, devicesPattern string, isController bool) (*Driver, error) {
 	if driverName == "" {
 		driverName = DefaultDriverName
 	}
 
-	tokenSource := oauth2.StaticTokenSource(&oauth2.Token{
-		AccessToken: token,
-	})
-	oauthClient := oauth2.NewClient(context.Background(), tokenSource)
-
-	all, err := metadata.NewClient().Metadata()
-	if err != nil {
-		return nil, fmt.Errorf("couldn't get metadata: %s", err)
-	}
-
-	region := all.Region
-	nodeId := strconv.Itoa(all.DropletID)
-
-	opts := []godo.ClientOpt{}
-	opts = append(opts, godo.SetBaseURL(url))
-
 	if version == "" {
 		version = "dev"
 	}
-	opts = append(opts, godo.SetUserAgent("csi-digitalocean/"+version))
-
-	doClient, err := godo.New(oauthClient, opts...)
-	if err != nil {
-		return nil, fmt.Errorf("couldn't initialize DigitalOcean client: %s", err)
-	}
 
 	log := logrus.New().WithFields(logrus.Fields{
-		"region":  region,
-		"node_id": nodeId,
+		"node_id": nodeID,
 		"version": version,
 	})
 
@@ -126,22 +94,17 @@ func NewDriver(ep, token, url, doTag, driverName string) (*Driver, error) {
 		name:                  driverName,
 		publishInfoVolumeName: driverName + "/volume-name",
 
-		doTag:    doTag,
 		endpoint: ep,
-		nodeId:   nodeId,
-		region:   region,
-		mounter:  newMounter(log),
-		log:      log,
+		nodeID:   nodeID,
+
+		vgName:         vgName,
+		devicesPattern: devicesPattern,
+		mounter:        newMounter(log),
+		storage:        &LVMStorage{},
+		log:            log,
 		// for now we're assuming only the controller has a non-empty token. In
 		// the future we should pass an explicit flag to the driver.
-		isController: token != "",
-
-		storage:        doClient.Storage,
-		storageActions: doClient.StorageActions,
-		droplets:       doClient.Droplets,
-		snapshots:      doClient.Snapshots,
-		account:        doClient.Account,
-		tags:           doClient.Tags,
+		isController: isController,
 	}, nil
 }
 

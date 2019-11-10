@@ -43,7 +43,7 @@ const (
 const (
 	// minimumVolumeSizeInBytes is used to validate that the user is not trying
 	// to create a volume that is smaller than what we support
-	minimumVolumeSizeInBytes int64 = 1 * giB
+	minimumVolumeSizeInBytes int64 = 100 * miB
 
 	// maximumVolumeSizeInBytes is used to validate that the user is not trying
 	// to create a volume that is larger than what we support
@@ -54,11 +54,7 @@ const (
 	defaultVolumeSizeInBytes int64 = 16 * giB
 
 	// createdByDO is used to tag volumes that are created by this CSI plugin
-	createdByDO = "Created by DigitalOcean CSI driver"
-
-	// doAPITimeout sets the timeout we will use when communicating with the
-	// Digital Ocean API. NOTE: some queries inherit the context timeout
-	doAPITimeout = 10 * time.Second
+	createdByDO = "Created by Metal Pod CSI driver"
 )
 
 var (
@@ -92,13 +88,13 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	if req.AccessibilityRequirements != nil {
 		for _, t := range req.AccessibilityRequirements.Requisite {
-			region, ok := t.Segments["region"]
+			nodeID, ok := t.Segments["node"]
 			if !ok {
 				continue // nothing to do
 			}
 
-			if region != d.region {
-				return nil, status.Errorf(codes.ResourceExhausted, "volume can be only created in region: %q, got: %q", d.region, region)
+			if nodeID != d.nodeID {
+				return nil, status.Errorf(codes.ResourceExhausted, "volume can be only created on node: %q, got: %q", d.nodeID, nodeID)
 			}
 		}
 	}
@@ -113,63 +109,15 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	})
 	ll.Info("create volume called")
 
-	// get volume first, if it's created do no thing
-	volumes, _, err := d.storage.ListVolumes(ctx, &godo.ListVolumeParams{
-		Region: d.region,
-		Name:   volumeName,
-	})
+	output, err := d.storage.createVG(d.vgName, d.devicesPattern)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(codes.Internal, fmt.Sprintf("unable to create vg: %v output:%s", err, output))
 	}
 
-	// volume already exist, do nothing
-	if len(volumes) != 0 {
-		if len(volumes) > 1 {
-			return nil, fmt.Errorf("fatal issue: duplicate volume %q exists", volumeName)
-		}
-		vol := volumes[0]
-
-		if vol.SizeGigaBytes*giB != size {
-			return nil, status.Error(codes.AlreadyExists, fmt.Sprintf("invalid option requested size: %d", size))
-		}
-
-		ll.Info("volume already created")
-		return &csi.CreateVolumeResponse{
-			Volume: &csi.Volume{
-				VolumeId:      vol.ID,
-				CapacityBytes: vol.SizeGigaBytes * giB,
-			},
-		}, nil
-	}
-
-	volumeReq := &godo.VolumeCreateRequest{
-		Region:        d.region,
-		Name:          volumeName,
-		Description:   createdByDO,
-		SizeGigaBytes: size / giB,
-	}
-
-	if d.doTag != "" {
-		volumeReq.Tags = append(volumeReq.Tags, d.doTag)
-	}
-
-	contentSource := req.GetVolumeContentSource()
-	if contentSource != nil && contentSource.GetSnapshot() != nil {
-		snapshotID := contentSource.GetSnapshot().GetSnapshotId()
-		if snapshotID == "" {
-			return nil, status.Error(codes.InvalidArgument, "snapshot ID is empty")
-		}
-
-		// check if the snapshot exist before we continue
-		_, resp, err := d.snapshots.Get(ctx, snapshotID)
-		if err != nil {
-			if resp != nil && resp.StatusCode == http.StatusNotFound {
-				return nil, status.Errorf(codes.NotFound, "snapshot %q not found", snapshotID)
-			}
-		}
-
-		ll.WithField("snapshot_id", snapshotID).Info("using snapshot as volume source")
-		volumeReq.SnapshotID = snapshotID
+	// FIXME extract lvmtype annotation from pvc
+	name, err := d.storage.createLVS(context.Background(), d.vgName, volumeName, uint64(size), mirrorType)
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("unable to create lv: %v output:%s", err, output))
 	}
 
 	ll.Info("checking volume limit")
@@ -177,20 +125,14 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, err
 	}
 
-	ll.WithField("volume_req", volumeReq).Info("creating volume")
-	vol, _, err := d.storage.CreateVolume(ctx, volumeReq)
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
 	resp := &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
-			VolumeId:      vol.ID,
+			VolumeId:      name,
 			CapacityBytes: size,
 			AccessibleTopology: []*csi.Topology{
 				{
 					Segments: map[string]string{
-						"region": d.region,
+						"node": d.nodeID,
 					},
 				},
 			},
