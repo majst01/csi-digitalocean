@@ -382,6 +382,8 @@ spec:
           args :
             - "--endpoint=$(CSI_ENDPOINT)"
             - "--nodeid=$(KUBE_NODE_NAME)"
+            - "--devices-pattern=/dev/loop[0-9]"
+            - "--vgname=csi-lvm"
           env:
             - name: CSI_ENDPOINT
               value: unix:///csi/csi.sock
