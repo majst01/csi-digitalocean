@@ -48,15 +48,12 @@ const (
 	// defaultVolumeSizeInBytes is used when the user did not provide a size or
 	// the size they provided did not satisfy our requirements
 	defaultVolumeSizeInBytes int64 = 16 * giB
-
-	// createdByDO is used to tag volumes that are created by this CSI plugin
-	createdByDO = "Created by Metal Pod CSI driver"
 )
 
 var (
 	// DO currently only support a single node to be attached to a single node
 	// in read/write mode. This corresponds to `accessModes.ReadWriteOnce` in a
-	// PVC resource on Kubernets
+	// PVC resource on Kubernetes
 	supportedAccessMode = &csi.VolumeCapability_AccessMode{
 		Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
 	}

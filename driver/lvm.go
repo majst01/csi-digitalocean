@@ -109,6 +109,9 @@ func (s *LVMStorage) createLVS(ctx context.Context, vg string, name string, size
 	log.Printf("lvreate %s", args)
 	cmd := exec.Command("lvcreate", args...)
 	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("lvcreate output:%s error:%v ", out, err)
+	}
 	log.Printf("lv created:%s", out)
 	return name, nil
 }
