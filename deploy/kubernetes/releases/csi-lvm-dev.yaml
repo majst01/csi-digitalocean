@@ -76,23 +76,23 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
-        - name: csi-attacher
-          image: quay.io/k8scsi/csi-attacher:v1.2.1
-          args:
-            - "--v=5"
-            - "--csi-address=$(ADDRESS)"
-            - "--leader-election"
-          env:
-            - name: MY_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: ADDRESS
-              value: /var/lib/csi/sockets/pluginproxy/csi.socket
-          imagePullPolicy: "IfNotPresent"
-          volumeMounts:
-            - name: socket-dir
-              mountPath: /var/lib/csi/sockets/pluginproxy/
+        # - name: csi-attacher
+        #   image: quay.io/k8scsi/csi-attacher:v1.2.1
+        #   args:
+        #     - "--v=5"
+        #     - "--csi-address=$(ADDRESS)"
+        #     - "--leader-election"
+        #   env:
+        #     - name: MY_NAME
+        #       valueFrom:
+        #         fieldRef:
+        #           fieldPath: metadata.name
+        #     - name: ADDRESS
+        #       value: /var/lib/csi/sockets/pluginproxy/csi.socket
+        #   imagePullPolicy: "IfNotPresent"
+        #   volumeMounts:
+        #     - name: socket-dir
+        #       mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: csi-lvm-plugin
           image: metalpod/csi-lvm:v0.3.0
           args :
