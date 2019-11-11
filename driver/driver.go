@@ -146,15 +146,6 @@ func (d *Driver) Run() error {
 		return resp, err
 	}
 
-	// warn the user, it'll not propagate to the user but at least we see if
-	// something is wrong in the logs. Only check if the driver is running with
-	// a token (i.e: controller)
-	if d.isController {
-		if err := d.checkLimit(context.Background()); err != nil {
-			d.log.WithError(err).Warn("CSI plugin will not function correctly, please resolve volume limit")
-		}
-	}
-
 	d.srv = grpc.NewServer(grpc.UnaryInterceptor(errHandler))
 	csi.RegisterIdentityServer(d.srv, d)
 	csi.RegisterControllerServer(d.srv, d)

@@ -11,14 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+FROM golang:1.13-alpine as builder
+RUN apk add make binutils git
+COPY / /work
+WORKDIR /work
+RUN make csi-lvm
 
-FROM alpine:3.7
-
+FROM alpine:3.10
 RUN apk add --no-cache ca-certificates \
                        e2fsprogs \
-                       findmnt \
-                       xfsprogs
+                       findmnt
 
-ADD do-csi-plugin /bin/
+COPY --from=builder /work/bin/csi-lvm /bin/
 
-ENTRYPOINT ["/bin/do-csi-plugin"]
+ENTRYPOINT ["/bin/csi-lvm"]

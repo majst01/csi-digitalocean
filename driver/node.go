@@ -26,7 +26,9 @@ package driver
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"strconv"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/sirupsen/logrus"
@@ -90,10 +92,20 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		fsType = mnt.FsType
 	}
 
+	sizeString, ok := req.VolumeContext["bytes"]
+	if !ok {
+		return nil, status.Error(codes.InvalidArgument, "Could not find the volume size in context")
+	}
+	size, err := strconv.ParseUint(sizeString, 10, 64)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("Could not parse volume size:%s err:%v", sizeString, err))
+	}
+
 	ll := d.log.WithFields(logrus.Fields{
 		"volume_id":           req.VolumeId,
 		"volume_name":         volumeName,
 		"volume_context":      req.VolumeContext,
+		"volume_size_bytes":   size,
 		"publish_context":     req.PublishContext,
 		"staging_target_path": req.StagingTargetPath,
 		"source":              source,
@@ -101,6 +113,19 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		"mount_options":       options,
 		"method":              "node_stage_volume",
 	})
+
+	output, err := d.storage.createVG(d.vgName, d.devicesPattern)
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("unable to create vg: %v output:%s", err, output))
+	}
+
+	// FIXME extract lvmtype annotation from pvc
+	name, err := d.storage.createLVS(context.Background(), d.vgName, volumeName, size, mirrorType)
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("unable to create lv: %v output:%s", err, output))
+	}
+
+	ll.Infof("LV %s created", name)
 
 	var noFormat bool
 	for _, ann := range annsNoFormatVolume {

@@ -11,7 +11,7 @@ LDFLAGS ?= -X github.com/metal-pod/csi-lvm/driver.version=${VERSION} -X github.c
 PKG ?= github.com/metal-pod/csi-lvm/cmd/do-csi-plugin
 
 VERSION ?= $(shell cat VERSION)
-DOCKER_REPO ?= digitalocean/do-csi-plugin
+DOCKER_REPO ?= metalpod/csi-lvm
 
 all: test
 
@@ -33,7 +33,7 @@ bump-version:
 .PHONY: compile
 compile:
 	@echo "==> Building the project"
-	@docker run --rm -it -e GOOS=${OS} -e GOARCH=amd64 -v ${PWD}/:/app -w /app golang:1.13-alpine sh -c 'apk add git && go build -o cmd/do-csi-plugin/${NAME} -ldflags "$(LDFLAGS)" ${PKG}'
+	@docker run --rm -it -e GOOS=${OS} -e GOARCH=amd64 -v ${PWD}/:/app -w /app golang:1.13-alpine sh -c 'apk add git && go build -o cmd/csi-lvm/${NAME} -ldflags "$(LDFLAGS)" ${PKG}'
 
 .PHONY: test
 test:
@@ -45,10 +45,15 @@ test-integration:
 	@echo "==> Started integration tests"
 	@env go test -count 1 -v -tags integration ./test/...
 
-.PHONY: build
-build:
+.PHONY: csi-lvm
+csi-lvm:
+	go build -tags netgo -o bin/csi-lvm cmd/csi-lvm/*.go
+	strip bin/csi-lvm
+
+.PHONY: docker-image
+docker-image:
 	@echo "==> Building the docker image"
-	@docker build -t $(DOCKER_REPO):$(VERSION) cmd/do-csi-plugin -f cmd/do-csi-plugin/Dockerfile
+	@docker build -t $(DOCKER_REPO):$(VERSION) . -f cmd/csi-lvm/Dockerfile
 
 .PHONY: push
 push:

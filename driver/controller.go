@@ -19,14 +19,10 @@ package driver
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/digitalocean/godo"
-	"github.com/golang/protobuf/ptypes"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -101,6 +97,14 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	volumeName := req.Name
 
+	accessMode := "filesystem"
+	for _, cap := range req.VolumeCapabilities {
+		if cap.GetBlock() != nil {
+			accessMode = "block"
+			break
+		}
+	}
+
 	ll := d.log.WithFields(logrus.Fields{
 		"volume_name":             volumeName,
 		"storage_size_giga_bytes": size / giB,
@@ -109,25 +113,9 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	})
 	ll.Info("create volume called")
 
-	output, err := d.storage.createVG(d.vgName, d.devicesPattern)
-	if err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("unable to create vg: %v output:%s", err, output))
-	}
-
-	// FIXME extract lvmtype annotation from pvc
-	name, err := d.storage.createLVS(context.Background(), d.vgName, volumeName, uint64(size), mirrorType)
-	if err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("unable to create lv: %v output:%s", err, output))
-	}
-
-	ll.Info("checking volume limit")
-	if err := d.checkLimit(ctx); err != nil {
-		return nil, err
-	}
-
 	resp := &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
-			VolumeId:      name,
+			VolumeId:      volumeName,
 			CapacityBytes: size,
 			AccessibleTopology: []*csi.Topology{
 				{
@@ -135,6 +123,10 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 						"node": d.nodeID,
 					},
 				},
+			},
+			VolumeContext: map[string]string{
+				"bytes":       string(size),
+				"access_mode": accessMode,
 			},
 		},
 	}
@@ -155,20 +147,6 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	})
 	ll.Info("delete volume called")
 
-	resp, err := d.storage.DeleteVolume(ctx, req.VolumeId)
-	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			// we assume it's deleted already for idempotency
-			ll.WithFields(logrus.Fields{
-				"error": err,
-				"resp":  resp,
-			}).Warn("assuming volume is deleted already")
-			return &csi.DeleteVolumeResponse{}, nil
-		}
-		return nil, err
-	}
-
-	ll.WithField("response", resp).Info("volume is deleted")
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
@@ -209,93 +187,10 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	})
 	ll.Info("controller publish volume called")
 
-	// check if volume exist before trying to attach it
-	vol, resp, err := d.storage.GetVolume(ctx, req.VolumeId)
-	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			return nil, status.Errorf(codes.NotFound, "volume %q not found", req.VolumeId)
-		}
-		return nil, err
-	}
-
-	if d.doTag != "" {
-		err = d.tagVolume(ctx, vol)
-		if err != nil {
-			ll.Errorf("error tagging volume: %s", err)
-			return nil, status.Errorf(codes.Internal, "failed to tag volume")
-		}
-	}
-
-	// check if droplet exist before trying to attach the volume to the droplet
-	_, resp, err = d.droplets.Get(ctx, dropletID)
-	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			return nil, status.Errorf(codes.NotFound, "droplet %d not found", dropletID)
-		}
-		return nil, err
-	}
-
-	attachedID := 0
-	for _, id := range vol.DropletIDs {
-		attachedID = id
-		if id == dropletID {
-			ll.Info("volume is already attached")
-			return &csi.ControllerPublishVolumeResponse{
-				PublishContext: map[string]string{
-					d.publishInfoVolumeName: vol.Name,
-				},
-			}, nil
-		}
-	}
-
-	// droplet is attached to a different node, return an error
-	if attachedID != 0 {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"volume %q is attached to the wrong droplet (%d), detach the volume to fix it",
-			req.VolumeId, attachedID)
-	}
-
-	// attach the volume to the correct node
-	action, resp, err := d.storageActions.Attach(ctx, req.VolumeId, dropletID)
-	if err != nil {
-		// don't do anything if attached
-		if resp != nil && resp.StatusCode == http.StatusUnprocessableEntity {
-			if strings.Contains(err.Error(), "This volume is already attached") {
-				ll.WithFields(logrus.Fields{
-					"error": err,
-					"resp":  resp,
-				}).Warn("assuming volume is attached already")
-				return &csi.ControllerPublishVolumeResponse{
-					PublishContext: map[string]string{
-						d.publishInfoVolumeName: vol.Name,
-					},
-				}, nil
-			}
-
-			if strings.Contains(err.Error(), "Droplet already has a pending event") {
-				ll.WithFields(logrus.Fields{
-					"error": err,
-					"resp":  resp,
-				}).Warn("droplet is not able to attach the volume")
-				// sending an abort makes sure the csi-attacher retries with the next backoff tick
-				return nil, status.Errorf(codes.Aborted, "volume %q couldn't be attached. droplet %d is in process of another action",
-					req.VolumeId, dropletID)
-			}
-		}
-		return nil, err
-	}
-
-	if action != nil {
-		ll.Info("waiting until volume is attached")
-		if err := d.waitAction(ctx, req.VolumeId, action.ID); err != nil {
-			return nil, err
-		}
-	}
-
 	ll.Info("volume is attached")
 	return &csi.ControllerPublishVolumeResponse{
 		PublishContext: map[string]string{
-			d.publishInfoVolumeName: vol.Name,
+			d.publishInfoVolumeName: req.VolumeId,
 		},
 	}, nil
 }
@@ -321,57 +216,6 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 	})
 	ll.Info("controller unpublish volume called")
 
-	// check if volume exist before trying to detach it
-	_, resp, err := d.storage.GetVolume(ctx, req.VolumeId)
-	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			// assume it's detached
-			return &csi.ControllerUnpublishVolumeResponse{}, nil
-		}
-		return nil, err
-	}
-
-	// check if droplet exist before trying to detach the volume from the droplet
-	_, resp, err = d.droplets.Get(ctx, dropletID)
-	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			return nil, status.Errorf(codes.NotFound, "droplet %d not found", dropletID)
-		}
-		return nil, err
-	}
-
-	action, resp, err := d.storageActions.DetachByDropletID(ctx, req.VolumeId, dropletID)
-	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusUnprocessableEntity {
-			if strings.Contains(err.Error(), "Attachment not found") {
-				ll.WithFields(logrus.Fields{
-					"error": err,
-					"resp":  resp,
-				}).Warn("assuming volume is detached already")
-				return &csi.ControllerUnpublishVolumeResponse{}, nil
-			}
-
-			if strings.Contains(err.Error(), "Droplet already has a pending event") {
-				ll.WithFields(logrus.Fields{
-					"error": err,
-					"resp":  resp,
-				}).Warn("droplet is not able to detach the volume")
-				// sending an abort makes sure the csi-attacher retries with the next backoff tick
-				return nil, status.Errorf(codes.Aborted, "volume %q couldn't be detached. droplet %d is in process of another action",
-					req.VolumeId, dropletID)
-			}
-		}
-		return nil, err
-	}
-
-	if action != nil {
-		ll.Info("waiting until volume is detached")
-		if err := d.waitAction(ctx, req.VolumeId, action.ID); err != nil {
-			return nil, err
-		}
-	}
-
-	ll.Info("volume is detached")
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
@@ -394,15 +238,6 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 	})
 	ll.Info("validate volume capabilities called")
 
-	// check if volume exist before trying to validate it it
-	_, volResp, err := d.storage.GetVolume(ctx, req.VolumeId)
-	if err != nil {
-		if volResp != nil && volResp.StatusCode == http.StatusNotFound {
-			return nil, status.Errorf(codes.NotFound, "volume %q not found", req.VolumeId)
-		}
-		return nil, err
-	}
-
 	// if it's not supported (i.e: wrong region), we shouldn't override it
 	resp := &csi.ValidateVolumeCapabilitiesResponse{
 		Confirmed: &csi.ValidateVolumeCapabilitiesResponse_Confirmed{
@@ -420,87 +255,12 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 
 // ListVolumes returns a list of all requested volumes
 func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
-	var page int
-	var err error
-	if req.StartingToken != "" {
-		page, err = strconv.Atoi(req.StartingToken)
-		if err != nil {
-			return nil, status.Errorf(codes.Aborted, "starting_token is invalid: %s", err)
-		}
-	}
-
-	listOpts := &godo.ListVolumeParams{
-		ListOptions: &godo.ListOptions{
-			PerPage: int(req.MaxEntries),
-			Page:    page,
-		},
-		Region: d.region,
-	}
-
-	ll := d.log.WithFields(logrus.Fields{
-		"list_opts":          listOpts,
-		"req_starting_token": req.StartingToken,
-		"method":             "list_volumes",
-	})
-	ll.Info("list volumes called")
-
-	var volumes []godo.Volume
-	lastPage := 0
-	for {
-		vols, resp, err := d.storage.ListVolumes(ctx, listOpts)
-		if err != nil {
-			return nil, err
-		}
-
-		volumes = append(volumes, vols...)
-
-		if page > len(volumes) {
-			return nil, status.Error(codes.Aborted, "starting_token is is greater than total number of vols")
-		}
-
-		if len(volumes) == int(req.MaxEntries) {
-			lastPage = int(req.MaxEntries)
-			break
-		}
-
-		if resp.Links == nil || resp.Links.IsLastPage() {
-			if resp.Links != nil {
-				page, err := resp.Links.CurrentPage()
-				if err != nil {
-					return nil, err
-				}
-				// save this for the response
-				lastPage = page
-			}
-			break
-		}
-
-		page, err := resp.Links.CurrentPage()
-		if err != nil {
-			return nil, err
-		}
-
-		listOpts.ListOptions.Page = page + 1
-	}
-
-	var entries []*csi.ListVolumesResponse_Entry
-	for _, vol := range volumes {
-		entries = append(entries, &csi.ListVolumesResponse_Entry{
-			Volume: &csi.Volume{
-				VolumeId:      vol.ID,
-				CapacityBytes: vol.SizeGigaBytes * giB,
-			},
-		})
-	}
-
-	// TODO(arslan): check that the NextToken logic works fine, might be racy
-	resp := &csi.ListVolumesResponse{
-		Entries:   entries,
-		NextToken: strconv.Itoa(lastPage),
-	}
-
-	ll.WithField("response", resp).Info("volumes listed")
-	return resp, nil
+	// TODO(arslan): check if we can provide this information somehow
+	d.log.WithFields(logrus.Fields{
+		"maxentries": req.GetMaxEntries,
+		"method":     "list_volumes",
+	}).Warn("list volumes is not implemented")
+	return nil, status.Error(codes.Unimplemented, "")
 }
 
 // GetCapacity returns the capacity of the storage pool
@@ -527,11 +287,12 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 
 	var caps []*csi.ControllerServiceCapability
 	for _, cap := range []csi.ControllerServiceCapability_RPC_Type{
+		// TODO Our controller does nothing
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
-		csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
-		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
-		csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
+		// csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
+		// csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
+		// csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
 	} {
 		caps = append(caps, newCap(cap))
 	}
@@ -550,106 +311,20 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 // CreateSnapshot will be called by the CO to create a new snapshot from a
 // source volume on behalf of a user.
 func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
-	if req.GetName() == "" {
-		return nil, status.Error(codes.InvalidArgument, "CreateSnapshot Name must be provided")
-	}
-
-	if req.GetSourceVolumeId() == "" {
-		return nil, status.Error(codes.InvalidArgument, "CreateSnapshot Source Volume ID must be provided")
-	}
-
-	ll := d.log.WithFields(logrus.Fields{
-		"req_name":             req.GetName(),
-		"req_source_volume_id": req.GetSourceVolumeId(),
-		"req_parameters":       req.GetParameters(),
-		"method":               "create_snapshot",
-	})
-
-	ll.Info("create snapshot is called")
-
-	// get snapshot first, if it's created do no thing
-	snapshots, _, err := d.storage.ListSnapshots(ctx, req.GetSourceVolumeId(), nil)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "couldn't fetch snapshots: %s", err.Error())
-	}
-
-	for _, snap := range snapshots {
-		if snap.Name == req.GetName() && snap.ResourceID == req.GetSourceVolumeId() {
-			s, err := toCSISnapshot(&snap)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal,
-					"couldn't convert DO snapshot to CSI snapshot: %s", err.Error())
-			}
-
-			return &csi.CreateSnapshotResponse{
-				Snapshot: s,
-			}, nil
-		}
-	}
-
-	snapReq := &godo.SnapshotCreateRequest{
-		VolumeID:    req.GetSourceVolumeId(),
-		Name:        req.GetName(),
-		Description: createdByDO,
-	}
-	if d.doTag != "" {
-		snapReq.Tags = append(snapReq.Tags, d.doTag)
-	}
-
-	snap, resp, err := d.storage.CreateSnapshot(ctx, snapReq)
-	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusConflict {
-			// 409 is returned when we try to snapshot a volume with the same
-			// name
-			ll.WithFields(logrus.Fields{
-				"error": err,
-				"resp":  resp,
-			}).Warn("snapshot create failed, might be due using an existing name")
-			return nil, status.Errorf(codes.AlreadyExists, "snapshot with name %s already exists", req.GetName())
-		}
-
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
-	s, err := toCSISnapshot(snap)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal,
-			"couldn't convert DO snapshot to CSI snapshot: %s", err.Error())
-	}
-
-	return &csi.CreateSnapshotResponse{
-		Snapshot: s,
-	}, nil
+	// TODO(arslan): check if we can provide this information somehow
+	d.log.WithFields(logrus.Fields{
+		"method": "create_snapshot",
+	}).Warn("create snapshot is not implemented")
+	return nil, status.Error(codes.Unimplemented, "")
 }
 
 // DeleteSnapshot will be called by the CO to delete a snapshot.
 func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
-	ll := d.log.WithFields(logrus.Fields{
-		"req_snapshot_id": req.GetSnapshotId(),
-		"method":          "delete_snapshot",
-	})
-
-	ll.Info("delete snapshot is called")
-
-	if req.GetSnapshotId() == "" {
-		return nil, status.Error(codes.InvalidArgument, "DeleteSnapshot Snapshot ID must be provided")
-	}
-
-	resp, err := d.storage.DeleteSnapshot(ctx, req.GetSnapshotId())
-	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			// we assume it's deleted already for idempotency
-			ll.WithFields(logrus.Fields{
-				"error": err,
-				"resp":  resp,
-			}).Warn("assuming snapshot is deleted already")
-			return &csi.DeleteSnapshotResponse{}, nil
-		}
-		return nil, err
-	}
-
-	ll.WithField("response", resp).Info("snapshot is deleted")
-	return &csi.DeleteSnapshotResponse{}, nil
+	// TODO(arslan): check if we can provide this information somehow
+	d.log.WithFields(logrus.Fields{
+		"method": "delete_snapshot",
+	}).Warn("delete snapshot is not implemented")
+	return nil, status.Error(codes.Unimplemented, "")
 }
 
 // ListSnapshots returns the information about all snapshots on the storage
@@ -657,95 +332,11 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 // ListSnapshots shold not list a snapshot that is being created but has not
 // been cut successfully yet.
 func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
-	// Pagination in the CSI world works different than at DO. CSI sends the
-	// `req.MaxEntries` to indicate how much snapshots it wants. The
-	// req.StartingToken is returned by us, if we somehow need to indicate that
-	// we couldn't fetch and need to fetch again. But it's NOT the page number.
-	// I.e: suppose CSI wants us to fetch 50 entries, we only fetch 30, we need to
-	// return NextToken as 31 (so req.StartingToken will be set to 31 when CSI
-	// calls us again), to indicate that we want to continue returning from the
-	// index 31 up to 50.
-
-	var nextToken int
-	var err error
-	if req.StartingToken != "" {
-		nextToken, err = strconv.Atoi(req.StartingToken)
-		if err != nil {
-			return nil, status.Errorf(codes.Aborted, "ListSnapshots starting token %s is not valid : %s",
-				req.StartingToken, err.Error())
-		}
-	}
-
-	if nextToken != 0 && req.MaxEntries != 0 {
-		return nil, status.Errorf(codes.Aborted,
-			"ListSnapshots invalid arguments starting token: %d and max entries: %d can't be non null at the same time", nextToken, req.MaxEntries)
-	}
-
-	ll := d.log.WithFields(logrus.Fields{
-		"req_starting_token": req.StartingToken,
-		"method":             "list_snapshots",
-	})
-	ll.Info("list snapshots is called")
-
-	// fetch all entries
-	listOpts := &godo.ListOptions{
-		PerPage: int(req.MaxEntries),
-	}
-	var snapshots []godo.Snapshot
-	for {
-		snaps, resp, err := d.snapshots.ListVolume(ctx, listOpts)
-		if err != nil {
-			return nil, status.Errorf(codes.Aborted, "ListSnapshots listing volume snapshots has failed: %s", err.Error())
-		}
-
-		snapshots = append(snapshots, snaps...)
-
-		if resp.Links == nil || resp.Links.IsLastPage() {
-			break
-		}
-
-		page, err := resp.Links.CurrentPage()
-		if err != nil {
-			return nil, err
-		}
-
-		listOpts.Page = page + 1
-		listOpts.PerPage = len(snaps)
-	}
-
-	if nextToken > len(snapshots) {
-		return nil, status.Error(codes.Aborted, "ListSnapshots starting token is greater than total number of snapshots")
-	}
-
-	if nextToken != 0 {
-		snapshots = snapshots[nextToken:]
-	}
-
-	if req.MaxEntries != 0 {
-		nextToken = len(snapshots) - int(req.MaxEntries) - 1
-		snapshots = snapshots[:req.MaxEntries]
-	}
-
-	entries := make([]*csi.ListSnapshotsResponse_Entry, 0, len(snapshots))
-	for _, snapshot := range snapshots {
-		snap, err := toCSISnapshot(&snapshot)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal,
-				"couldn't convert DO snapshot to CSI snapshot: %s", err.Error())
-		}
-
-		entries = append(entries, &csi.ListSnapshotsResponse_Entry{
-			Snapshot: snap,
-		})
-	}
-
-	listResp := &csi.ListSnapshotsResponse{
-		Entries:   entries,
-		NextToken: strconv.Itoa(nextToken),
-	}
-
-	ll.WithField("response", listResp).Info("snapshots listed")
-	return listResp, nil
+	// TODO(arslan): check if we can provide this information somehow
+	d.log.WithFields(logrus.Fields{
+		"method": "list_snapshot",
+	}).Warn("list snapshot is not implemented")
+	return nil, status.Error(codes.Unimplemented, "")
 }
 
 func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
@@ -834,102 +425,6 @@ func formatBytes(inputBytes int64) string {
 	return result + unit
 }
 
-// waitAction waits until the given action for the volume is completed
-func (d *Driver) waitAction(ctx context.Context, volumeId string, actionId int) error {
-	ll := d.log.WithFields(logrus.Fields{
-		"volume_id": volumeId,
-		"action_id": actionId,
-	})
-
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-
-	// TODO(arslan): use backoff in the future
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			action, _, err := d.storageActions.Get(ctx, volumeId, actionId)
-			if err != nil {
-				ll.WithError(err).Info("waiting for volume errored")
-				continue
-			}
-			ll.WithField("action_status", action.Status).Info("action received")
-
-			if action.Status == godo.ActionCompleted {
-				ll.Info("action completed")
-				return nil
-			}
-
-			if action.Status == godo.ActionInProgress {
-				continue
-			}
-		case <-ctx.Done():
-			return fmt.Errorf("timeout occurred waiting for storage action of volume: %q", volumeId)
-		}
-	}
-}
-
-// checkLimit checks whether the user hit their volume limit to ensure.
-func (d *Driver) checkLimit(ctx context.Context) error {
-	// only one provisioner runs, we can make sure to prevent burst creation
-	d.readyMu.Lock()
-	defer d.readyMu.Unlock()
-
-	account, _, err := d.account.Get(ctx)
-	if err != nil {
-		return status.Errorf(codes.Internal,
-			"couldn't get account information to check volume limit: %s", err.Error())
-	}
-
-	// administrative accounts might have zero length limits, make sure to not check them
-	if account.VolumeLimit == 0 {
-		return nil //  hail to the king!
-	}
-
-	// NOTE(arslan): the API returns the limit for *all* regions, so passing
-	// the region down as a parameter doesn't change the response.
-	// Nevertheless, this is something we should be aware of.
-	volumes, _, err := d.storage.ListVolumes(ctx, &godo.ListVolumeParams{
-		Region: d.region,
-	})
-	if err != nil {
-		return status.Errorf(codes.Internal,
-			"couldn't get fetch volume list to check volume limit: %s", err.Error())
-	}
-
-	if account.VolumeLimit <= len(volumes) {
-		return status.Errorf(codes.ResourceExhausted,
-			"volume limit (%d) has been reached. Current number of volumes: %d. Please contact support.",
-			account.VolumeLimit, len(volumes))
-	}
-
-	return nil
-}
-
-// toCSISnapshot converts a DO Snapshot struct into a csi.Snapshot struct
-func toCSISnapshot(snap *godo.Snapshot) (*csi.Snapshot, error) {
-	createdAt, err := time.Parse(time.RFC3339, snap.Created)
-	if err != nil {
-		return nil, fmt.Errorf("couldn't parse snapshot's created field: %s", err.Error())
-	}
-
-	tstamp, err := ptypes.TimestampProto(createdAt)
-	if err != nil {
-		return nil, fmt.Errorf("couldn't convert protobuf timestamp to go time.Time: %s",
-			err.Error())
-	}
-
-	return &csi.Snapshot{
-		SnapshotId:     snap.ID,
-		SourceVolumeId: snap.ResourceID,
-		SizeBytes:      int64(snap.SizeGigaBytes) * giB,
-		CreationTime:   tstamp,
-		ReadyToUse:     true,
-	}, nil
-}
-
 // validateCapabilities validates the requested capabilities. It returns false
 // if it doesn't satisfy the currently supported modes of DigitalOcean Block
 // Storage
@@ -957,46 +452,4 @@ func validateCapabilities(caps []*csi.VolumeCapability) bool {
 	}
 
 	return supported
-}
-
-func (d *Driver) tagVolume(parentCtx context.Context, vol *godo.Volume) error {
-	for _, tag := range vol.Tags {
-		if tag == d.doTag {
-			return nil
-		}
-	}
-
-	tagReq := &godo.TagResourcesRequest{
-		Resources: []godo.Resource{
-			godo.Resource{
-				ID:   vol.ID,
-				Type: godo.VolumeResourceType,
-			},
-		},
-	}
-
-	ctx, cancel := context.WithTimeout(parentCtx, doAPITimeout)
-	defer cancel()
-	resp, err := d.tags.TagResources(ctx, d.doTag, tagReq)
-	if resp == nil || resp.StatusCode != http.StatusNotFound {
-		// either success or irrecoverable failure
-		return err
-	}
-
-	// godo.TagsService returns 404 if the tag has not yet been
-	// created, if that happens we need to create the tag
-	// and then retry tagging the volume resource.
-	ctx, cancel = context.WithTimeout(parentCtx, doAPITimeout)
-	defer cancel()
-	_, _, err = d.tags.Create(parentCtx, &godo.TagCreateRequest{
-		Name: d.doTag,
-	})
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel = context.WithTimeout(parentCtx, doAPITimeout)
-	defer cancel()
-	_, err = d.tags.TagResources(ctx, d.doTag, tagReq)
-	return err
 }
