@@ -13,7 +13,7 @@ PKG ?= github.com/metal-pod/csi-lvm/cmd/do-csi-plugin
 VERSION ?= $(shell cat VERSION)
 DOCKER_REPO ?= metalpod/csi-lvm
 
-all: test
+all: test csi-lvm
 
 publish: compile build push clean
 
@@ -23,17 +23,12 @@ bump-version:
 	@(echo ${NEW_VERSION} | grep -E "^v") || ( echo "NEW_VERSION must be a semver ('v' prefix is required)"; exit 1 )
 	@echo "Bumping VERSION from $(VERSION) to $(NEW_VERSION)"
 	@echo $(NEW_VERSION) > VERSION
-	@cp deploy/kubernetes/releases/csi-digitalocean-${VERSION}.yaml deploy/kubernetes/releases/csi-digitalocean-${NEW_VERSION}.yaml
-	@sed -i'' -e 's#digitalocean/do-csi-plugin:${VERSION}#digitalocean/do-csi-plugin:${NEW_VERSION}#g' deploy/kubernetes/releases/csi-digitalocean-${NEW_VERSION}.yaml
+	@cp deploy/kubernetes/releases/csi-lvm-${VERSION}.yaml deploy/kubernetes/releases/csi-lvm-${NEW_VERSION}.yaml
+	@sed -i'' -e 's#metalpod/csi-lvm:${VERSION}#metalpod/csi-lvm:${NEW_VERSION}#g' deploy/kubernetes/releases/csi-lvm-${NEW_VERSION}.yaml
 	@sed -i'' -e 's/${VERSION}/${NEW_VERSION}/g' README.md
 	$(eval NEW_DATE = $(shell date +%Y.%m.%d))
 	@sed -i'' -e 's/## unreleased/## ${NEW_VERSION} - ${NEW_DATE}/g' CHANGELOG.md
 	@ echo '## unreleased\n' | cat - CHANGELOG.md > temp && mv temp CHANGELOG.md
-
-.PHONY: compile
-compile:
-	@echo "==> Building the project"
-	@docker run --rm -it -e GOOS=${OS} -e GOARCH=amd64 -v ${PWD}/:/app -w /app golang:1.13-alpine sh -c 'apk add git && go build -o cmd/csi-lvm/${NAME} -ldflags "$(LDFLAGS)" ${PKG}'
 
 .PHONY: test
 test:
