@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
  
-# Configuration to deploy release version of the CSI DigitalOcean
-# plugin (https://github.com/digitalocean/csi-digitalocean) compatible with
-# Kubernetes >=v1.14+
-#
 # example usage: kubectl create -f <this_file>
 #
 
@@ -30,62 +26,6 @@ metadata:
 spec:
   attachRequired: true
   podInfoOnMount: true
-
----
-
-##############################################
-###########                       ############
-###########     Snapshot CRDs     ############
-###########                       ############
-##############################################
-#
-# The following CRD's are created by the csi-snapshotter, however it
-# complicates installing a driver, because we're not able to install a custom
-# VolumeSnapshotClass until the csi-snapshotter sidecar is up and running.  We
-# pulled out the CRD's and put them here to simplify the installation for the
-# users. Make sure these are up to date with the original ones whenever we
-# release a new version: https://github.com/kubernetes-csi/external-snapshotter/blob/master/cmd/csi-snapshotter/create_crd.go
-
-apiVersion: apiextensions.k8s.io/v1beta1
-kind: CustomResourceDefinition
-metadata:
-  name: volumesnapshotclasses.snapshot.storage.k8s.io
-spec:
-  group: snapshot.storage.k8s.io
-  names:
-    kind: VolumeSnapshotClass
-    plural: volumesnapshotclasses
-  scope: Cluster
-  version: v1alpha1
-
----
-
-apiVersion: apiextensions.k8s.io/v1beta1
-kind: CustomResourceDefinition
-metadata:
-  name: volumesnapshotcontents.snapshot.storage.k8s.io
-spec:
-  group: snapshot.storage.k8s.io
-  names:
-    kind: VolumeSnapshotContent
-    plural: volumesnapshotcontents
-  scope: Cluster
-  version: v1alpha1
-
----
-
-apiVersion: apiextensions.k8s.io/v1beta1
-kind: CustomResourceDefinition
-metadata:
-  name: volumesnapshots.snapshot.storage.k8s.io
-spec:
-  group: snapshot.storage.k8s.io
-  names:
-    kind: VolumeSnapshot
-    plural: volumesnapshots
-  scope: Namespaced
-  version: v1alpha1
-
 ---
 kind: StorageClass
 apiVersion: storage.k8s.io/v1
@@ -153,18 +93,6 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
-        - name: csi-snapshotter
-          image: quay.io/k8scsi/csi-snapshotter:v1.2.2
-          args:
-            - "--v=5"
-            - "--csi-address=$(ADDRESS)"
-          env:
-            - name: ADDRESS
-              value: /var/lib/csi/sockets/pluginproxy/csi.sock
-          imagePullPolicy: Always
-          volumeMounts:
-            - name: socket-dir
-              mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: csi-lvm-plugin
           image: metalpod/csi-lvm:v0.3.0
           args :
@@ -218,12 +146,6 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list", "watch", "create", "update", "patch"]
-  - apiGroups: ["snapshot.storage.k8s.io"]
-    resources: ["volumesnapshots"]
-    verbs: ["get", "list"]
-  - apiGroups: ["snapshot.storage.k8s.io"]
-    resources: ["volumesnapshotcontents"]
-    verbs: ["get", "list"]
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
@@ -278,56 +200,6 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 
 ---
-
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: csi-lvm-snapshotter-role
-rules:
-  - apiGroups: [""]
-    resources: ["persistentvolumes"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["persistentvolumeclaims"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["storage.k8s.io"]
-    resources: ["storageclasses"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["list", "watch", "create", "update", "patch"]
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list"]
-  - apiGroups: ["snapshot.storage.k8s.io"]
-    resources: ["volumesnapshotclasses"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["snapshot.storage.k8s.io"]
-    resources: ["volumesnapshotcontents"]
-    verbs: ["create", "get", "list", "watch", "update", "delete"]
-  - apiGroups: ["snapshot.storage.k8s.io"]
-    resources: ["volumesnapshots"]
-    verbs: ["get", "list", "watch", "update"]
-  - apiGroups: ["apiextensions.k8s.io"]
-    resources: ["customresourcedefinitions"]
-    verbs: ["create", "list", "watch", "delete"]
-
----
-kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: csi-lvm-snapshotter-binding
-subjects:
-  - kind: ServiceAccount
-    name: csi-lvm-controller-sa
-    namespace: kube-system
-roleRef:
-  kind: ClusterRole
-  name: csi-lvm-snapshotter-role
-  apiGroup: rbac.authorization.k8s.io
-
----
-
 ########################################
 ###########                 ############
 ###########   Node plugin   ############
